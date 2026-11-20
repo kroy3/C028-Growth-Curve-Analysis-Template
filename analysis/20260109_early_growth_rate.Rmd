@@ -1,0 +1,165 @@
+---
+title: "20260109 PPX1,PPN1 reentry: early growth rate instead of lag time"
+author: Kushal Raj Roy
+date: 2026-11-19, updated `r Sys.Date()`
+output:
+  html_notebook:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    theme: readable
+---
+
+```{r setup, message=FALSE}
+require(tidyverse)
+library(gcplyr)
+old <- theme_set(theme_bw(base_size = 14))
+```
+
+## Why this notebook
+In `20260109_PPX1_PPN1_reentry.Rmd`, `gcplyr::lag_time()` gives noisy, mostly
+meaningless lag times. In 52 of 56 wells it warns "lag time is less than min(x),
+indicating no identifiable lag phase": the maximum per-capita growth rate falls
+at 0.49 h, the first timepoint where a 5-point derivative exists, so the reported
+lag (~0.12 h) is earlier than the first read. The cells grow from the first reads.
+
+Swapping the single blank for row-matched blanks did not change lag-time spread
+(median within-group SD 0.0048 vs 0.0047 h), so the blank is not what makes the
+lag noisy.
+
+This notebook reports two measures that do not need a lag phase to exist and are
+not set by inoculum density:
+
+1. **Early growth rate**: slope of log(OD - blank) vs time over the first
+   `EARLY_WINDOW` hours (per hour).
+2. **Time to double starting density**: first time the smoothed, blank-subtracted
+   OD reaches 2x its starting value (median of the first 3 reads).
+
+Starting OD sits only 0.02 to 0.1 above the blank, so both are computed under the
+lowest, median and highest empty-well blank to show how much the blank choice matters.
+
+## Parameters
+```{r}
+EARLY_WINDOW <- 3      # hours used for the early growth-rate fit
+EMPTY_MAX_OD <- 0.12   # a well whose max OD stays below this is treated as empty
+```
+
+## Data
+```{r}
+dat_wide <- read_wides(files = "../input/20260109_PPX1_PPN1_reentry.csv") |>
+  mutate(Time = time_length(hms(Time), unit = "hour"))
+dat_tidy <- trans_wide_to_tidy(dat_wide, id_cols = c("file", "Time")) |>
+  mutate(Col = as.integer(substring(Well, 2)))
+meta_info <- read_csv("../input/20260109_plate_layout.csv", show_col_types = FALSE) |>
+  mutate(Starved_h = as.numeric(sub("h", "", Group)))
+```
+
+## Blank
+Column 6 wells drift upward by about 0.015 OD over the run (contamination or
+evaporation), so they are excluded from the blank.
+```{r}
+well_stats <- dat_tidy |>
+  group_by(Well, Col) |>
+  summarize(max_od = max(Measurements), med_od = median(Measurements),
+            drift = max(Measurements) - min(Measurements), .groups = "drop")
+well_stats |> filter(Col == 6) |> select(Well, drift)
+
+blank_wells <- well_stats |> filter(max_od < EMPTY_MAX_OD, Col != 6)
+blanks <- c(low  = min(blank_wells$med_od),
+            mid  = median(blank_wells$med_od),
+            high = max(blank_wells$med_od))
+round(blanks, 4)
+```
+
+## Early growth metrics
+```{r}
+early_metrics <- function(blank_value) {
+  dat_tidy |>
+    filter(Well %in% meta_info$Well) |>
+    arrange(Well, Time) |>
+    group_by(Well) |>
+    mutate(y = Measurements - blank_value,
+           y_sm = smooth_data(x = Time, y = y, sm_method = "loess",
+                              span = .15, degree = 1)) |>
+    summarize(
+      y0 = median(y[1:3]),
+      t_double = first_above(x = Time, y = y_sm, threshold = 2 * y0, return = "x"),
+      r_early = {
+        k <- Time <= EARLY_WINDOW & y > 0
+        unname(coef(lm(log(y[k]) ~ Time[k]))[2])
+      },
+      .groups = "drop")
+}
+
+res <- imap_dfr(blanks, \(b, nm) early_metrics(b) |> mutate(blank = nm)) |>
+  left_join(meta_info, by = "Well")
+
+grp <- res |>
+  group_by(blank, Genotype, Starved_h) |>
+  summarize(n = n(), y0 = mean(y0),
+            t_double_mean = mean(t_double), t_double_sd = sd(t_double),
+            r_mean = mean(r_early), r_sd = sd(r_early), .groups = "drop")
+grp |> filter(blank == "mid") |> select(-blank)
+```
+
+Blank sensitivity of the group means:
+```{r}
+grp |>
+  select(blank, Genotype, Starved_h, r_mean, t_double_mean) |>
+  pivot_wider(names_from = blank, values_from = c(r_mean, t_double_mean))
+```
+
+## Figure
+```{r fig.width=7, fig.height=8}
+geno_cols <- c("Wildtype" = "#2a78d6", "PPX1,PPN1 KO" = "#eb6834")
+long <- res |>
+  select(Well, Genotype, Starved_h, blank, t_double, r_early) |>
+  pivot_longer(c(t_double, r_early), names_to = "metric") |>
+  mutate(metric = factor(metric, c("t_double", "r_early"),
+                         c("Time to double starting density (h)",
+                           paste0("Early growth rate, 0-", EARLY_WINDOW, " h (per h)"))))
+pts <- filter(long, blank == "mid")
+rng <- long |>
+  group_by(Genotype, Starved_h, metric, blank) |>
+  summarize(m = mean(value), .groups = "drop") |>
+  group_by(Genotype, Starved_h, metric) |>
+  summarize(lo = min(m), hi = max(m), mid = m[blank == "mid"], .groups = "drop")
+dodge <- position_dodge(width = 0.35)
+
+p <- ggplot(pts, aes(x = factor(Starved_h), y = value, colour = Genotype, shape = Genotype)) +
+  geom_point(position = position_jitterdodge(jitter.width = 0.12, dodge.width = 0.35),
+             size = 2.2, alpha = 0.75) +
+  geom_linerange(data = rng, aes(y = mid, ymin = lo, ymax = hi),
+                 position = dodge, linewidth = 0.9) +
+  geom_point(data = rng, aes(y = mid), position = dodge,
+             size = 3.4, shape = 21, fill = "white", stroke = 1.2) +
+  facet_wrap(~metric, ncol = 1, scales = "free_y") +
+  scale_colour_manual(values = geno_cols) +
+  scale_shape_manual(values = c(16, 17)) +
+  guides(colour = guide_legend(override.aes = list(shape = c(16, 17), linetype = 0,
+                                                   size = 3, fill = NA, stroke = 0.5)),
+         shape = "none") +
+  labs(x = "Hours of phosphate starvation before re-entry", y = NULL,
+       colour = NULL, shape = NULL,
+       title = "Re-entry growth, 2026-01-09 plate",
+       subtitle = "Small points: wells (mid blank). Open circle: group mean. Bar: mean under low to high blank") +
+  theme(legend.position = "top", panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_blank(), strip.background = element_blank(),
+        strip.text = element_text(hjust = 0, face = "bold"),
+        plot.subtitle = element_text(size = 10, colour = "#52514e"))
+p
+ggsave("../output/20260109_early_growth_rate.png", p, width = 7, height = 8, dpi = 200)
+write_csv(res, "../output/20260109_early_growth_by_well.csv")
+```
+
+## Notes
+- Both genotypes grow at about 0.34 per h after 0 h starvation. From 0.5 h of
+  starvation on, wildtype is faster (about 0.40 to 0.49 per h) than the KO (about
+  0.29 to 0.35 per h), and this ordering holds under all three blanks.
+- KO wells start 1.5 to 3x denser than wildtype after blank subtraction, so
+  genotype and starting density are partly confounded on this plate.
+- 4 wells per condition from one plate; likely technical replicates, so no
+  statistical test is run here.
+- Outlier wells: one in KO 3h, and C3 (wildtype 4h), which jumps in its first reads.
+- For future runs: read the empty plate before inoculation (true per-well blank),
+  start at a lower and matched OD, and record the time cells were added.
